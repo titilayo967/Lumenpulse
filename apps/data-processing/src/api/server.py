@@ -18,6 +18,12 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from sentiment import SentimentAnalyzer
 from src.utils.logger import setup_logger, correlation_id_ctx, generate_correlation_id
 from src.utils.metrics import API_FAILURES_TOTAL, generate_latest, CONTENT_TYPE_LATEST
+from src.security import (
+    security_config,
+    setup_security_middleware,
+    setup_rate_limiter,
+    get_rate_limit_decorator,
+)
 
 # Initialize structured logger
 logger = setup_logger(__name__)
@@ -28,6 +34,17 @@ app = FastAPI(
     description="Exposes sentiment analysis for Node.js backend integration",
     version="1.0.0",
 )
+
+# Setup security middleware (API key authentication)
+setup_security_middleware(app)
+
+# Setup rate limiting
+limiter = security_config.limiter
+if limiter:
+    setup_rate_limiter(app, limiter)
+    logger.info(f"Rate limiting enabled: {security_config.rate_limit_default}")
+else:
+    logger.warning("Rate limiting is disabled")
 
 # Add CORS middleware to allow requests from Node.js backend
 app.add_middleware(
@@ -80,21 +97,25 @@ async def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.get("/")
-async def root() -> Dict[str, Any]:
+@limiter.limit("20/minute") if limiter else lambda x: x
+async def root(request: Request) -> Dict[str, Any]:
     """Root endpoint with API information"""
     return {
         "service": "Sentiment Analysis API",
         "version": "1.0.0",
         "endpoints": {
-            "GET /health": "Health check",
-            "POST /analyze": "Analyze text sentiment (expects {text: string})",
+            "GET /health": "Health check (no auth required)",
+            "GET /metrics": "Prometheus metrics (no auth required)",
+            "POST /analyze": "Analyze text sentiment (requires X-API-Key header)",
         },
         "note": "Returns sentiment score between -1 (negative) and 1 (positive)",
+        "security": "All endpoints except /health and /metrics require X-API-Key header",
     }
 
 
 @app.get("/health", response_model=HealthResponse)
-async def health_check() -> HealthResponse:
+@limiter.limit("30/minute") if limiter else lambda x: x
+async def health_check(request: Request) -> HealthResponse:
     """Health check endpoint for monitoring"""
     from datetime import datetime
 
@@ -106,7 +127,8 @@ async def health_check() -> HealthResponse:
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze_text(request: AnalyzeRequest) -> AnalyzeResponse:
+@limiter.limit("50/minute") if limiter else lambda x: x
+async def analyze_text(request: AnalyzeRequest, request_context: Request) -> AnalyzeResponse:
     """
     Analyze the sentiment of provided text.
 
@@ -128,7 +150,8 @@ async def analyze_text(request: AnalyzeRequest) -> AnalyzeResponse:
         result = sentiment_analyzer.analyze(request.text)
 
         logger.info(
-            f"Analyzed text: '{request.text[:50]}...' -> sentiment: {result.compound_score}"
+            f"Analyzed text: '{request.text[:50]}...' -> sentiment: {result.compound_score} | "
+            f"client_ip: {request_context.client.host}"
         )
 
         # Return just the compound_score as "sentiment" for Node.js compatibility
@@ -143,7 +166,8 @@ async def analyze_text(request: AnalyzeRequest) -> AnalyzeResponse:
 
 # Optional: Batch analysis endpoint if needed
 @app.post("/analyze-batch")
-async def analyze_batch(texts: list[str]) -> Dict[str, Any]:
+@limiter.limit("10/minute") if limiter else lambda x: x
+async def analyze_batch(request_context: Request, texts: list[str]) -> Dict[str, Any]:
     """Batch analyze multiple texts"""
     try:
         if not texts:
