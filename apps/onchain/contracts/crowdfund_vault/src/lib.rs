@@ -711,14 +711,42 @@ impl CrowdfundVaultContract {
             Self::divest_funds_internal(&env, project_id, amount_to_divest)?;
         }
 
-        // Transfer tokens from contract to owner
         let contract_address = env.current_contract_address();
+
+        // Calculate and deduct fee
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+        let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
+
+        let fee_amount = if treasury.is_some() && fee_bps > 0 {
+            (amount.checked_mul(fee_bps as i128).unwrap_or(0)) / 10_000
+        } else {
+            0
+        };
+
+        let withdraw_amount = amount - fee_amount;
+
+        if fee_amount > 0 {
+            token::transfer(
+                &env,
+                &project.token_address,
+                &contract_address,
+                &treasury.clone().unwrap(),
+                &fee_amount,
+            );
+            events::ProtocolFeeDeductedEvent {
+                project_id,
+                amount: fee_amount,
+            }
+            .publish(&env);
+        }
+
+        // Transfer remaining tokens from contract to owner
         token::transfer(
             &env,
             &project.token_address,
             &contract_address,
             &project.owner,
-            &amount,
+            &withdraw_amount,
         );
 
         // Update project balance
@@ -736,7 +764,7 @@ impl CrowdfundVaultContract {
         events::WithdrawEvent {
             owner: project.owner,
             project_id,
-            amount,
+            amount: withdraw_amount,
         }
         .publish(&env);
 
@@ -998,6 +1026,35 @@ impl CrowdfundVaultContract {
             return Ok(0);
         }
 
+        // Calculate fee
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+        let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
+
+        let fee_amount = if treasury.is_some() && fee_bps > 0 {
+            (actual_match.checked_mul(fee_bps as i128).unwrap_or(0)) / 10_000
+        } else {
+            0
+        };
+
+        let match_after_fee = actual_match - fee_amount;
+
+        // Transfer fee to treasury if any
+        if fee_amount > 0 {
+            let contract_address = env.current_contract_address();
+            token::transfer(
+                &env,
+                &project.token_address,
+                &contract_address,
+                &treasury.unwrap(),
+                &fee_amount,
+            );
+            events::ProtocolFeeDeductedEvent {
+                project_id,
+                amount: fee_amount,
+            }
+            .publish(&env);
+        }
+
         // Update matching pool balance
         env.storage()
             .persistent()
@@ -1008,16 +1065,16 @@ impl CrowdfundVaultContract {
         let current_balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&balance_key, &(current_balance + actual_match));
+            .set(&balance_key, &(current_balance + match_after_fee));
 
         // Update project total deposited (matching funds count as deposits)
         let mut project = project;
-        project.total_deposited += actual_match;
+        project.total_deposited += match_after_fee;
         env.storage()
             .persistent()
             .set(&DataKey::Project(project_id), &project);
 
-        Ok(actual_match)
+        Ok(match_after_fee)
     }
 
     /// Get matching pool balance for a token
@@ -1181,6 +1238,32 @@ impl CrowdfundVaultContract {
             new_admin,
         }
         .publish(&env);
+        Ok(())
+    }
+
+    /// Set protocol fee configuration
+    pub fn set_fee_config(
+        env: Env,
+        admin: Address,
+        fee_bps: u32,
+        treasury: Address,
+    ) -> Result<(), CrowdfundError> {
+        Self::verify_admin(&env, &admin)?;
+
+        if fee_bps > 10_000 {
+            return Err(CrowdfundError::InvalidAmount);
+        }
+
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+
+        events::FeeConfigChangedEvent {
+            admin,
+            fee_bps,
+            treasury,
+        }
+        .publish(&env);
+
         Ok(())
     }
 

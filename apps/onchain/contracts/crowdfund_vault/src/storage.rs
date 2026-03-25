@@ -22,6 +22,8 @@ pub enum DataKey {
     ProjectStatus(u64),
     YieldProvider(Address),         // token_address -> yield_provider_address
     ProjectInvestedBalance(u64),    // project_id -> i128
+    FeeBps,   // -> u32
+    Treasury, // -> Address
     Subscribers,
 }
 
